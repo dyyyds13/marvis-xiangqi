@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 训练产物
+models/
+logs/
+games/
+
+# 临时
+temp/
+*.log
