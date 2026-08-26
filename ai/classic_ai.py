@@ -3,6 +3,7 @@
 import time
 from core.board import XiangqiBoard, RED, BLACK
 from ai.evaluator import evaluate, evaluate_side
+from core.rules import would_be_illegal_cycle, is_repetition, classify_move
 
 # 走法排序：吃子优先（MVV-LVA），将军优先
 PIECE_ORDER = {1: 6, 2: 1, 3: 1, 4: 3, 5: 5, 6: 3, 7: 2,
@@ -12,10 +13,16 @@ PIECE_ORDER = {1: 6, 2: 1, 3: 1, 4: 3, 5: 5, 6: 3, 7: 2,
 def _move_score(board: XiangqiBoard, mv: int) -> int:
     fsq, tsq = divmod(mv, 90)
     captured = board.board[tsq]
+    score = 0
     if captured:
         # MVV-LVA：吃大子优先
-        return 10000 + PIECE_ORDER[captured] * 100 - PIECE_ORDER[board.board[fsq]]
-    return 0
+        score = 10000 + PIECE_ORDER[captured] * 100 - PIECE_ORDER[board.board[fsq]]
+    # 棋规约束：走法导致局面重复且为将/捉/杀 → 降权（避免长将/长捉/长杀）
+    if is_repetition(board, mv):
+        t = classify_move(board, mv)
+        if t in ('将', '捉', '杀'):
+            score -= 5000
+    return score
 
 
 class ClassicAI:
@@ -74,24 +81,32 @@ class ClassicAI:
             return best
 
     def best_move(self, board: XiangqiBoard) -> int:
-        """返回最佳走法（迭代加深）"""
+        """返回最佳走法（迭代加深）。搜索在副本上进行，不修改原棋盘。"""
         moves = board.legal_moves()
         if not moves:
             return -1
         if len(moves) == 1:
             return moves[0]
+        work = board.copy()
+        # 棋规约束：剔除会导致自己长将/长捉/长杀违规的走法
+        ok_moves = []
+        for mv in moves:
+            if not would_be_illegal_cycle(work, mv):
+                ok_moves.append(mv)
+        if ok_moves:
+            moves = ok_moves
         self._deadline = time.time() + self.time_limit
         best = moves[0]
         try:
             for d in range(1, self.depth + 1):
                 alpha = -float('inf')
                 beta = float('inf')
-                ordered = self._order_moves(board, moves)
+                ordered = self._order_moves(work, moves)
                 cur_best = ordered[0]
                 for mv in ordered:
-                    board.make_move(mv)
-                    v = self._search(board, d - 1, alpha, beta)
-                    board.unmake_move()
+                    work.make_move(mv)
+                    v = self._search(work, d - 1, alpha, beta)
+                    work.unmake_move()
                     if board.turn == RED:
                         if v > alpha:
                             alpha = v

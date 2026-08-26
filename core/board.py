@@ -118,6 +118,7 @@ class XiangqiBoard:
         self._init_zobrist()
         if fen:
             self.set_fen(fen)
+        self._hash_history = [self._hash]  # 局面哈希历史（循环检测）
 
     # ---------- Zobrist 哈希 ----------
     def _init_zobrist(self):
@@ -163,6 +164,7 @@ class XiangqiBoard:
             elif p == B_KING:
                 self._king_pos[BLACK] = sq
         self._init_hash()
+        self._hash_history = [self._hash]
 
     def fen(self) -> str:
         rows = []
@@ -209,6 +211,7 @@ class XiangqiBoard:
         b._zobrist = self._zobrist
         b._zobrist_turn = self._zobrist_turn
         b._hash = self._hash
+        b._hash_history = list(self._hash_history)
         return b
 
     # ---------- 走法生成 ----------
@@ -355,12 +358,13 @@ class XiangqiBoard:
                         break
                 nr += dr
                 nc += dc
-        # 马
+        # 马：马在目标的反向位置 (r-dr, c-dc)，沿 (dr,dc) 走到 (r,c)，
+        # 蹩腿从马当前位置 (nr,nc) 加 (br,bc) 计算（与 _gen_pseudo_moves 一致）
         for (dr, dc), (br, bc) in HORSE_MOVES:
-            nr, nc = r + dr, c + dc
+            nr, nc = r - dr, c - dc
             if not in_board(nr, nc):
                 continue
-            leg = rc_to_sq(r + br, c + bc)
+            leg = rc_to_sq(nr + br, nc + bc)
             if self.board[leg] != EMPTY:
                 continue
             p = self.board[rc_to_sq(nr, nc)]
@@ -426,22 +430,32 @@ class XiangqiBoard:
         for mv in pseudo:
             fsq, tsq = divmod(mv, 90)
             captured = self.board[tsq]
-            self.board[tsq] = self.board[fsq]
+            moved = self.board[fsq]
+            self.board[tsq] = moved
             self.board[fsq] = EMPTY
+            # 临时更新将帅位置缓存（走将/帅时 in_check 依赖它）
+            if moved == R_KING:
+                self._king_pos[RED] = tsq
+            elif moved == B_KING:
+                self._king_pos[BLACK] = tsq
             # 更新哈希
-            self._hash ^= self._zobrist[fsq][self.board[tsq]]
-            self._hash ^= self._zobrist[tsq][self.board[tsq]]
+            self._hash ^= self._zobrist[fsq][moved]
+            self._hash ^= self._zobrist[tsq][moved]
             if captured:
                 self._hash ^= self._zobrist[tsq][captured]
             if not self.in_check(color):
                 legal.append(mv)
             # 回退
-            self._hash ^= self._zobrist[fsq][self.board[tsq]]
-            self._hash ^= self._zobrist[tsq][self.board[tsq]]
+            self._hash ^= self._zobrist[fsq][moved]
+            self._hash ^= self._zobrist[tsq][moved]
             if captured:
                 self._hash ^= self._zobrist[tsq][captured]
-            self.board[fsq] = self.board[tsq]
+            self.board[fsq] = moved
             self.board[tsq] = captured
+            if moved == R_KING:
+                self._king_pos[RED] = fsq
+            elif moved == B_KING:
+                self._king_pos[BLACK] = fsq
         return legal
 
     def make_move(self, mv: int):
@@ -461,6 +475,7 @@ class XiangqiBoard:
         self._hash ^= self._zobrist_turn
         if self.turn == RED:
             self.fullmove += 1
+        self._hash_history.append(self._hash)
 
     def unmake_move(self):
         if not self._history:
@@ -480,6 +495,7 @@ class XiangqiBoard:
         self.turn = turn
         self.fullmove = fullmove
         self._hash ^= self._zobrist_turn
+        self._hash_history.pop()
 
     # ---------- 胜负判定 ----------
     def is_game_over(self) -> bool:
@@ -494,6 +510,11 @@ class XiangqiBoard:
         # 自然限着：60 回合（120 半回合）无吃子判和
         if self.halfmove >= 120:
             return '1/2-1/2'
+        # 循环局面裁决（长将/长捉/长杀/不变作和）
+        from .rules import check_cycle
+        cycle_result = check_cycle(self)
+        if cycle_result:
+            return cycle_result
         return None
 
     def move_to_uci(self, mv: int) -> str:

@@ -5,6 +5,7 @@ import random
 import torch
 import torch.nn.functional as F
 from core.board import XiangqiBoard, RED, BLACK
+from core.rules import would_be_illegal_cycle
 from ai.model import XiangqiNet, legal_move_mask
 
 
@@ -66,6 +67,13 @@ class MCTS:
         node.legal_moves = moves
         if not moves:
             return
+        # 棋规约束：剔除会导致自己长将/长捉/长杀违规的走法
+        ok_moves = []
+        for mv in moves:
+            if not would_be_illegal_cycle(board, mv):
+                ok_moves.append(mv)
+        if ok_moves:
+            moves = ok_moves
         # 网络推理
         p, v = self.net.predict(board)
         # 只保留合法走法的概率，重归一化
@@ -139,6 +147,9 @@ class MCTS:
         """在根节点执行 num_simulations 次模拟，返回走法概率分布 {move: prob}"""
         root = MCTSNode(0.0)
         self._expand(board, root)
+        if not root.children:
+            # 无合法走法（被将死或困毙），返回空分布
+            return {}
         # 根节点加 Dirichlet 噪声（训练时探索）
         if self.dirichlet_eps > 0:
             noise = torch.distributions.Dirichlet(
@@ -162,6 +173,8 @@ class MCTS:
         return {mv: v / total for mv, v in exp_visits.items()}
 
     def best_move(self, board: XiangqiBoard, temperature: float = 0.0) -> int:
-        """返回最佳走法"""
+        """返回最佳走法；无合法走法（被将死或困毙）时返回 -1"""
         probs = self.search(board, temperature)
+        if not probs:
+            return -1
         return max(probs, key=probs.get)

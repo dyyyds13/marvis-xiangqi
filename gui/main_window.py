@@ -55,6 +55,24 @@ class AIWorker(QThread):
         self._hint = True
 
 
+class TrainWorker(QThread):
+    """后台训练线程：运行完整训练主循环（自我对弈 + 训练 + 评估）"""
+
+    def __init__(self, trainer, max_steps: int = 100000,
+                 eval_interval_sec: int = 300, parent=None):
+        super().__init__(parent)
+        self.trainer = trainer
+        self.max_steps = max_steps
+        self.eval_interval_sec = eval_interval_sec
+
+    def run(self):
+        try:
+            self.trainer.run(max_steps=self.max_steps,
+                             eval_interval_sec=self.eval_interval_sec)
+        except Exception as e:
+            print(f'训练线程异常: {e}')
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -64,6 +82,7 @@ class MainWindow(QMainWindow):
         self.board = XiangqiBoard()
         self.engine_name = 'classic'
         self.difficulty = 'hard'
+        self.human_color = RED        # 玩家执子：RED=红方(先手)，BLACK=黑方(后手)
         self.classic_ai = make_classic_ai(self.difficulty)
         self.mcts = None
         self.ai_worker = None
@@ -124,6 +143,14 @@ class MainWindow(QMainWindow):
         self.diff_combo.currentIndexChanged.connect(self._on_diff_changed)
         row2.addWidget(self.diff_combo, 1)
         gl.addLayout(row2)
+        row_color = QHBoxLayout()
+        row_color.addWidget(QLabel('我方执子:'))
+        self.color_combo = QComboBox()
+        self.color_combo.addItem('红方（先手）', RED)
+        self.color_combo.addItem('黑方（后手）', BLACK)
+        self.color_combo.currentIndexChanged.connect(self._on_color_changed)
+        row_color.addWidget(self.color_combo, 1)
+        gl.addLayout(row_color)
         pl.addWidget(gb)
 
         # 操作按钮
@@ -218,15 +245,18 @@ class MainWindow(QMainWindow):
         self.hint_move = -1
         self.game_started = True
         self.board_widget.set_board(self.board)
-        self.board_widget.human_turn = True
+        # 玩家执红：人类先走；玩家执黑：AI(红方)先走
+        self.board_widget.human_turn = (self.human_color == RED)
         self.board_widget.game_over = False
         self.board_widget.last_move = None
         self.board_widget.check_sq = -1
         self.move_list_widget.clear()
         self._update_status()
+        if self.human_color == BLACK:
+            self._start_ai()
 
     def _on_human_move(self, mv: int):
-        """人类走子（红方）"""
+        """人类走子（红方或黑方均在此处理）"""
         self._apply_move(mv)
         if not self.board.is_game_over():
             self._start_ai()
@@ -266,7 +296,8 @@ class MainWindow(QMainWindow):
 
     def _on_ai_move(self, mv: int):
         if mv < 0:
-            self._update_status('AI 无子可走')
+            # AI 无子可走（被将死或困毙），判定胜负结束对局
+            self._update_status()
             return
         self._apply_move(mv)
         self.board_widget.human_turn = True
@@ -341,6 +372,7 @@ class MainWindow(QMainWindow):
             else:
                 self.status_label.setText('和棋')
             self.board_widget.human_turn = False
+            self.board_widget.game_over = True
             return
         turn = '红方' if self.board.turn == RED else '黑方'
         check = '（将军！）' if self.board.in_check(self.board.turn) else ''
@@ -358,6 +390,11 @@ class MainWindow(QMainWindow):
     def _on_diff_changed(self, idx):
         self.difficulty = self.diff_combo.itemData(idx)
         self.classic_ai = make_classic_ai(self.difficulty)
+
+    def _on_color_changed(self, idx):
+        """切换玩家执红/执黑，并开新对局"""
+        self.human_color = self.color_combo.itemData(idx)
+        self._new_game()
 
     # ---------- 棋谱 ----------
     def _save_pgn(self):
@@ -409,7 +446,10 @@ class MainWindow(QMainWindow):
                 model_dir=MODEL_DIR, log_dir=LOG_DIR,
                 num_workers=2, num_simulations=50,
             )
-            self._trainer.start_workers()
+            # 在独立线程中运行完整训练主循环（自我对弈->训练->保存->评估）
+            self._train_thread = TrainWorker(
+                self._trainer, max_steps=100000, eval_interval_sec=120)
+            self._train_thread.start()
             self.btn_train.setText('停止训练')
             self.train_label.setText('后台训练运行中（2 进程）…')
             self._train_timer = QTimer(self)
@@ -427,8 +467,11 @@ class MainWindow(QMainWindow):
 
     def _stop_train(self):
         if hasattr(self, '_trainer') and self._trainer is not None:
-            self._trainer.stop()
+            self._trainer.stop()   # 置 stop_event，训练循环优雅退出并保存模型
+            if hasattr(self, '_train_thread') and self._train_thread.isRunning():
+                self._train_thread.wait(5000)
             self._trainer = None
+            self._train_thread = None
             if hasattr(self, '_train_timer'):
                 self._train_timer.stop()
         self.btn_train.setText('启动后台训练')

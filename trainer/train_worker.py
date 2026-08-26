@@ -53,6 +53,21 @@ def self_play_worker(worker_id: int, sample_queue, model_path: str, stop_event,
             time.sleep(2)
 
 
+def evaluate_probe(model_path: str, result_queue, num_simulations: int,
+                   eval_games: int, channels: int = 32, blocks: int = 3):
+    """评估子进程：加载模型 vs 经典基线，结果写入队列（不阻塞训练主循环）"""
+    torch.set_num_threads(2)
+    try:
+        net = XiangqiNet(channels=channels, blocks=blocks)
+        load_model(net, model_path)
+        baseline = make_classic_player(depth=2, time_limit=0.5)
+        stats = evaluate_net(net, baseline, num_games=eval_games,
+                             num_simulations=num_simulations, as_red=True)
+        result_queue.put(stats)
+    except Exception as e:
+        result_queue.put({'error': str(e)})
+
+
 class Trainer:
     """主进程训练器"""
 
@@ -60,8 +75,9 @@ class Trainer:
                  num_simulations: int = 50, batch_size: int = 256,
                  lr: float = 1e-3, buffer_capacity: int = 200000,
                  train_every: int = 64, save_every: int = 20,
-                 eval_every: int = 50, eval_games: int = 10,
-                 channels: int = 32, blocks: int = 3):
+                 eval_every: int = 50, eval_games: int = 4,
+                 channels: int = 32, blocks: int = 3,
+                 resume: bool = True):
         self.model_dir = model_dir
         self.log_dir = log_dir
         self.num_workers = num_workers
@@ -81,6 +97,13 @@ class Trainer:
         self.best_path = os.path.join(model_dir, 'best.pt')
         self.log_path = os.path.join(log_dir, 'train.log')
         self.net = XiangqiNet(channels=channels, blocks=blocks)
+        # 断点续训：若已有 current.pt 则加载，避免每次从随机初始化
+        if resume and os.path.exists(self.model_path):
+            try:
+                load_model(self.net, self.model_path)
+                self._log(f'续训：加载已有模型 {self.model_path}')
+            except Exception:
+                self._log('模型加载失败，改用随机初始化')
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
         self.buffer = ReplayBuffer(buffer_capacity)
         self.sample_queue = mp.Queue(maxsize=200)
@@ -89,6 +112,11 @@ class Trainer:
         self.total_games = 0
         self.total_samples = 0
         self.train_steps = 0
+        # 异步评估
+        self.eval_probe_path = os.path.join(model_dir, 'eval_probe.pt')
+        self.eval_queue = mp.Queue()
+        self.eval_proc = None
+        self._eval_started = False
 
     def _log(self, msg: str):
         line = f'[{time.strftime("%H:%M:%S")}] {msg}'
@@ -97,7 +125,9 @@ class Trainer:
             f.write(line + '\n')
 
     def start_workers(self):
-        save_model(self.net, self.model_path)
+        # 模型文件不存在时才保存（续训场景下保留已训练权重）
+        if not os.path.exists(self.model_path):
+            save_model(self.net, self.model_path)
         for i in range(self.num_workers):
             p = mp.Process(target=self_play_worker, args=(
                 i, self.sample_queue, self.model_path, self.stop_event,
@@ -111,6 +141,10 @@ class Trainer:
         for p in self.workers:
             p.terminate()
         self.workers = []
+        if self.eval_proc is not None:
+            self.eval_proc.terminate()
+            self.eval_proc = None
+        self._eval_started = False
 
     def _drain_queue(self, timeout: float = 0.5) -> int:
         """从队列收样本，返回新增样本数"""
@@ -126,24 +160,54 @@ class Trainer:
                 break
         return added
 
-    def _evaluate(self) -> dict:
-        """评估当前模型 vs 经典基线"""
-        baseline = make_classic_player(depth=2, time_limit=0.5)
-        stats = evaluate_net(self.net, baseline, num_games=self.eval_games,
-                             num_simulations=self.num_simulations, as_red=True)
-        return stats
+    def _start_evaluate(self):
+        """异步启动评估子进程（保存权重快照供其读取，避免与训练竞争）"""
+        try:
+            save_model(self.net, self.eval_probe_path)
+            self._eval_started = True
+            self.eval_proc = mp.Process(
+                target=evaluate_probe,
+                args=(self.eval_probe_path, self.eval_queue,
+                      self.num_simulations, self.eval_games),
+                daemon=True)
+            self.eval_proc.start()
+            self._log('评估启动（异步，不阻塞训练）')
+        except Exception as e:
+            self._eval_started = False
+            self._log(f'评估启动失败: {e}')
+
+    def _poll_evaluate(self):
+        """轮询异步评估结果"""
+        if not self._eval_started:
+            return
+        try:
+            stats = self.eval_queue.get_nowait()
+        except queue.Empty:
+            return
+        self._eval_started = False
+        if self.eval_proc is not None:
+            self.eval_proc.join(timeout=1)
+            self.eval_proc = None
+        if 'error' in stats:
+            self._log(f'评估失败: {stats["error"]}')
+            return
+        self._log(f'评估: wins={stats["wins"]} draws={stats["draws"]} '
+                  f'losses={stats["losses"]} win_rate={stats["win_rate"]:.2f}')
+        if stats['win_rate'] >= 0.55:
+            save_model(self.net, self.best_path)
+            self._log('胜率达标，已保存为 best.pt')
 
     def run(self, max_steps: int = 100000, eval_interval_sec: int = 300):
-        """主训练循环"""
+        """主训练循环（评估异步进行，不阻塞训练）"""
         self.start_workers()
         self._log(f'训练开始: workers={self.num_workers}, sims={self.num_simulations}, '
                   f'batch={self.batch_size}, lr={self.lr}')
         last_eval = time.time()
         try:
-            while self.train_steps < max_steps:
+            while self.train_steps < max_steps and not self.stop_event.is_set():
                 # 收样本
                 added = self._drain_queue()
-                # 样本足够则训练
+                # 样本足够则训练（每步保存/打日志，避免跳号）
                 if len(self.buffer) >= self.batch_size and added > 0:
                     for _ in range(self.train_every):
                         if len(self.buffer) < self.batch_size:
@@ -152,20 +216,16 @@ class Trainer:
                         from trainer.train import train_step
                         stats = train_step(self.net, batch, self.optimizer)
                         self.train_steps += 1
-                    if self.train_steps % self.save_every == 0:
-                        save_model(self.net, self.model_path)
-                        self._log(f'step={self.train_steps} games={self.total_games} '
-                                  f'samples={self.total_samples} loss={stats["loss"]:.4f}')
-                # 定期评估
-                if time.time() - last_eval > eval_interval_sec:
+                        if self.train_steps % self.save_every == 0:
+                            save_model(self.net, self.model_path)
+                            self._log(f'step={self.train_steps} games={self.total_games} '
+                                      f'samples={self.total_samples} loss={stats["loss"]:.4f}')
+                # 异步评估：到点启动评估进程，训练循环不等待
+                if not self._eval_started and time.time() - last_eval > eval_interval_sec:
                     last_eval = time.time()
-                    stats = self._evaluate()
-                    self._log(f'评估: wins={stats["wins"]} draws={stats["draws"]} '
-                              f'losses={stats["losses"]} win_rate={stats["win_rate"]:.2f}')
-                    if stats['win_rate'] >= 0.55:
-                        save_model(self.net, self.best_path)
-                        self._log('胜率达标，已保存为 best.pt')
-                time.sleep(0.1)
+                    self._start_evaluate()
+                self._poll_evaluate()
+                time.sleep(0.05)
         except KeyboardInterrupt:
             self._log('训练中断')
         finally:
@@ -177,23 +237,24 @@ class Trainer:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description='中国象棋 RL 训练器')
-    parser.add_argument('--workers', type=int, default=4, help='自我对弈进程数')
+    parser.add_argument('--workers', type=int, default=6, help='自我对弈进程数（<=0 自动按 CPU 核数）')
     parser.add_argument('--sims', type=int, default=50, help='MCTS 模拟次数')
     parser.add_argument('--batch', type=int, default=256, help='训练 batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='学习率')
     parser.add_argument('--steps', type=int, default=100000, help='最大训练步数')
     parser.add_argument('--eval-interval', type=int, default=300, help='评估间隔(秒)')
+    parser.add_argument('--eval-games', type=int, default=4, help='每次评估对局数')
     parser.add_argument('--model-dir', type=str, default='models', help='模型目录')
     parser.add_argument('--log-dir', type=str, default='logs', help='日志目录')
     args = parser.parse_args()
 
     # 自动检测 CPU 核心数
     if args.workers <= 0:
-        args.workers = max(1, os.cpu_count() - 1)
+        args.workers = max(1, os.cpu_count() - 2)
     trainer = Trainer(
         model_dir=args.model_dir, log_dir=args.log_dir,
         num_workers=args.workers, num_simulations=args.sims,
-        batch_size=args.batch, lr=args.lr,
+        batch_size=args.batch, lr=args.lr, eval_games=args.eval_games,
     )
     trainer.run(max_steps=args.steps, eval_interval_sec=args.eval_interval)
 

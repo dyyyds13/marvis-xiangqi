@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QWidget
 
 from core.board import (
     XiangqiBoard, RED, BLACK, EMPTY, ROWS, COLS,
-    PIECE_NAMES, sq_to_rc, rc_to_sq,
+    PIECE_NAMES, sq_to_rc, rc_to_sq, color_of,
 )
 
 # 主题色
@@ -103,6 +103,8 @@ class BoardWidget(QWidget):
 
     def _draw_board_lines(self, p: QPainter):
         x0, y0 = self._board_origin
+        x0 += self.margin
+        y0 += self.margin
         pen = QPen(BOARD_LINE, 1.6)
         p.setPen(pen)
         # 横线
@@ -153,6 +155,8 @@ class BoardWidget(QWidget):
 
     def _draw_marks(self, p: QPainter):
         x0, y0 = self._board_origin
+        x0 += self.margin
+        y0 += self.margin
         # 上一步标记
         if self.last_move:
             fsq, tsq = self.last_move
@@ -189,6 +193,8 @@ class BoardWidget(QWidget):
 
     def _draw_pieces(self, p: QPainter):
         x0, y0 = self._board_origin
+        x0 += self.margin
+        y0 += self.margin
         for sq, piece in enumerate(self.board.board):
             if piece == EMPTY:
                 continue
@@ -239,7 +245,7 @@ class BoardWidget(QWidget):
         if self.selected >= 0:
             # 有选中：尝试走子
             if sq in self.legal_targets:
-                self.move_made.emit(sq * 90 + self.selected)  # 注意：move = from*90+to
+                self.move_made.emit(self.selected * 90 + sq)  # move = from*90+to
                 return
             # 点击自己棋子：切换选中
             if piece != EMPTY and color_of(piece) == self.board.turn:
