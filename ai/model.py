@@ -107,12 +107,13 @@ class XiangqiNet(nn.Module):
         return p, v
 
     def predict(self, board: XiangqiBoard):
-        """单局面推理，返回 (策略概率[8100], 价值)"""
+        """单局面推理，返回 (策略概率[8100], 价值)；自动对齐模型所在 device，返回 CPU 张量"""
         self.eval()
         with torch.no_grad():
-            t = board_to_tensor(board).unsqueeze(0)
+            dev = next(self.parameters()).device
+            t = board_to_tensor(board).unsqueeze(0).to(dev)
             p, v = self.forward(t)
-            p = F.softmax(p, dim=1).squeeze(0)
+            p = F.softmax(p, dim=1).squeeze(0).cpu()
             return p, v.item()
 
     def predict_batch(self, boards):

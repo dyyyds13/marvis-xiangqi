@@ -7,11 +7,18 @@
 - 模型同步：主进程保存 models/current.pt，工作进程定期检查 mtime 重载
 """
 import os
+import sys
 import time
 import queue
 import multiprocessing as mp
+import json
+import subprocess
 import torch
 import torch.nn as nn
+
+# 项目根目录（trainer/ 的上一级），用于定位 tools/update_progress.py
+PROJECT_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROGRESS_SCRIPT = os.path.join(PROJECT_BASE, 'tools', 'update_progress.py')
 
 from ai.model import XiangqiNet
 from ai.mcts import MCTS
@@ -76,6 +83,7 @@ class Trainer:
                  lr: float = 1e-3, buffer_capacity: int = 200000,
                  train_every: int = 64, save_every: int = 20,
                  eval_every: int = 50, eval_games: int = 4,
+                 progress_every: int = 100,
                  channels: int = 32, blocks: int = 3,
                  resume: bool = True):
         self.model_dir = model_dir
@@ -89,6 +97,7 @@ class Trainer:
         self.save_every = save_every
         self.eval_every = eval_every
         self.eval_games = eval_games
+        self.progress_every = progress_every
         self.channels = channels
         self.blocks = blocks
         os.makedirs(model_dir, exist_ok=True)
@@ -96,12 +105,14 @@ class Trainer:
         self.model_path = os.path.join(model_dir, 'current.pt')
         self.best_path = os.path.join(model_dir, 'best.pt')
         self.log_path = os.path.join(log_dir, 'train.log')
-        self.net = XiangqiNet(channels=channels, blocks=blocks)
+        # CUDA 兼容：有 GPU 时训练步跑 GPU，无 GPU 自动回退 CPU（保持原 CPU 行为）
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.net = XiangqiNet(channels=channels, blocks=blocks).to(self.device)
         # 断点续训：若已有 current.pt 则加载，避免每次从随机初始化
         if resume and os.path.exists(self.model_path):
             try:
-                load_model(self.net, self.model_path)
-                self._log(f'续训：加载已有模型 {self.model_path}')
+                load_model(self.net, self.model_path, device=self.device)
+                self._log(f'续训：加载已有模型 {self.model_path} (device={self.device})')
             except Exception:
                 self._log('模型加载失败，改用随机初始化')
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
@@ -123,6 +134,69 @@ class Trainer:
         print(line, flush=True)
         with open(self.log_path, 'a', encoding='utf-8') as f:
             f.write(line + '\n')
+
+    def _refresh_progress(self):
+        """异步刷新进度页（PNG + HTML），不阻塞训练主循环。
+
+        每 progress_every 步调用一次；上一次子进程未结束时跳过本次，
+        避免刷新进程堆积拖慢训练。
+        """
+        proc = getattr(self, '_progress_proc', None)
+        if proc is not None and proc.poll() is None:
+            return
+        try:
+            self._progress_proc = subprocess.Popen(
+                [sys.executable, PROGRESS_SCRIPT],
+                cwd=PROJECT_BASE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            self._log(f'进度页刷新失败（训练继续）: {e}')
+
+    def _notify_baseline_win(self, stats: dict):
+        """记录并尝试发送 Windows 通知，避免同一轮评估重复提醒。"""
+        alert_path = os.path.join(self.log_dir, 'baseline_win.alert')
+        payload = {
+            'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'wins': stats['wins'],
+            'draws': stats['draws'],
+            'losses': stats['losses'],
+            'win_rate': stats['win_rate'],
+            'score': stats['score'],
+            'model_path': os.path.abspath(self.model_path),
+        }
+        with open(alert_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        # 不依赖第三方包；失败时不影响训练，alert 文件仍然保留。
+        if os.name == 'nt':
+            title = '象棋强化学习'
+            message = (
+                f'已达到基线胜率：{stats["wins"]}胜 '
+                f'{stats["draws"]}和 {stats["losses"]}负'
+            )
+            script = (
+                '[Windows.UI.Notifications.ToastNotificationManager, '
+                'Windows.UI.Notifications, ContentType = WindowsRuntime];'
+                '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument;'
+                '$xml.LoadXml('
+                f'\'<toast><visual><binding template="ToastGeneric">'
+                f'<text>{title}</text><text>{message}</text>'
+                '</binding></visual></toast>\');'
+                '$toast = [Windows.UI.Notifications.ToastNotification]::new($xml);'
+                '[Windows.UI.Notifications.ToastNotificationManager]::'
+                'CreateToastNotifier("Marvis").Show($toast)'
+            )
+            try:
+                subprocess.Popen(
+                    ['powershell.exe', '-NoProfile', '-WindowStyle', 'Hidden',
+                     '-Command', script],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception as exc:
+                self._log(f'系统通知发送失败（训练继续）: {exc}')
 
     def start_workers(self):
         # 模型文件不存在时才保存（续训场景下保留已训练权重）
@@ -196,12 +270,14 @@ class Trainer:
         if stats['win_rate'] >= 0.55:
             save_model(self.net, self.best_path)
             self._log('胜率达标，已保存为 best.pt')
+            self._notify_baseline_win(stats)
 
     def run(self, max_steps: int = 100000, eval_interval_sec: int = 300):
         """主训练循环（评估异步进行，不阻塞训练）"""
         self.start_workers()
         self._log(f'训练开始: workers={self.num_workers}, sims={self.num_simulations}, '
                   f'batch={self.batch_size}, lr={self.lr}')
+        self._refresh_progress()
         last_eval = time.time()
         try:
             while self.train_steps < max_steps and not self.stop_event.is_set():
@@ -214,12 +290,15 @@ class Trainer:
                             break
                         batch = self.buffer.sample(self.batch_size)
                         from trainer.train import train_step
-                        stats = train_step(self.net, batch, self.optimizer)
+                        stats = train_step(self.net, batch, self.optimizer, device=self.device)
                         self.train_steps += 1
                         if self.train_steps % self.save_every == 0:
                             save_model(self.net, self.model_path)
                             self._log(f'step={self.train_steps} games={self.total_games} '
                                       f'samples={self.total_samples} loss={stats["loss"]:.4f}')
+                        # 每 progress_every 步自动刷新进度页（异步，不阻塞训练）
+                        if self.train_steps % self.progress_every == 0:
+                            self._refresh_progress()
                 # 异步评估：到点启动评估进程，训练循环不等待
                 if not self._eval_started and time.time() - last_eval > eval_interval_sec:
                     last_eval = time.time()
@@ -230,6 +309,7 @@ class Trainer:
             self._log('训练中断')
         finally:
             save_model(self.net, self.model_path)
+            self._refresh_progress()
             self.stop()
             self._log('训练结束')
 
@@ -244,6 +324,7 @@ def main():
     parser.add_argument('--steps', type=int, default=100000, help='最大训练步数')
     parser.add_argument('--eval-interval', type=int, default=300, help='评估间隔(秒)')
     parser.add_argument('--eval-games', type=int, default=4, help='每次评估对局数')
+    parser.add_argument('--progress-every', type=int, default=100, help='每 N 训练步刷新一次进度页')
     parser.add_argument('--model-dir', type=str, default='models', help='模型目录')
     parser.add_argument('--log-dir', type=str, default='logs', help='日志目录')
     args = parser.parse_args()
@@ -255,6 +336,7 @@ def main():
         model_dir=args.model_dir, log_dir=args.log_dir,
         num_workers=args.workers, num_simulations=args.sims,
         batch_size=args.batch, lr=args.lr, eval_games=args.eval_games,
+        progress_every=args.progress_every,
     )
     trainer.run(max_steps=args.steps, eval_interval_sec=args.eval_interval)
 

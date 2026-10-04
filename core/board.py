@@ -129,9 +129,14 @@ class XiangqiBoard:
 
     def _init_hash(self):
         h = 0
+        self._king_pos = [-1, -1]
         for sq, p in enumerate(self.board):
             if p:
                 h ^= self._zobrist[sq][p]
+                if p == R_KING:
+                    self._king_pos[RED] = sq
+                elif p == B_KING:
+                    self._king_pos[BLACK] = sq
         if self.turn == BLACK:
             h ^= self._zobrist_turn
         self._hash = h
