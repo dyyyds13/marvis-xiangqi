@@ -3,8 +3,12 @@
 
 架构：
 - 主进程：训练循环（回放池采样 -> 网络训练 -> 保存模型 -> 定期评估）
-- 工作进程：自我对弈（每进程独立 MCTS + 网络副本），样本经队列发回主进程
-- 模型同步：主进程保存 models/current.pt，工作进程定期检查 mtime 重载
+- 工作进程：自我对弈（GPU 路径：ServerEvaluator 走批量推理服务，不持有模型；
+  CPU 路径：本地 DirectEvaluator + 网络副本），样本经队列发回主进程
+- GPU 批量推理池：有 GPU 时启动 InferenceServer 进程，攒批统一推理，
+  大幅提升 GPU 利用率；无 GPU 时自动回退 CPU，行为与改造前一致
+- 模型同步：主进程保存 models/current.pt，推理服务定期检查 mtime 重载；
+  CPU 路径 worker 定期重载
 """
 import os
 import sys
@@ -21,37 +25,49 @@ PROJECT_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROGRESS_SCRIPT = os.path.join(PROJECT_BASE, 'tools', 'update_progress.py')
 
 from ai.model import XiangqiNet
-from ai.mcts import MCTS
+from ai.mcts import MCTS, BatchMCTS, DirectEvaluator, ServerEvaluator
 from trainer.self_play import self_play_game
 from trainer.train import ReplayBuffer, train_loop, save_model, load_model
 from trainer.evaluate import make_classic_player, evaluate_net
+from trainer.inference_server import InferenceServer
 
 
 def self_play_worker(worker_id: int, sample_queue, model_path: str, stop_event,
                      num_simulations: int = 50, games_before_reload: int = 5,
-                     max_moves: int = 200):
-    """工作进程：持续自我对弈并发送样本"""
+                     max_moves: int = 200, use_server: bool = False,
+                     req_queue=None, resp_queue=None):
+    """工作进程：持续自我对弈并发送样本
+
+    GPU 路径（use_server=True）：通过 ServerEvaluator 走 InferenceServer 批量推理，
+    worker 不持有模型权重，只做树搜索逻辑（权重同步由服务端按 mtime 完成）。
+    CPU 路径（use_server=False）：worker 本地持有网络副本（DirectEvaluator），
+    行为与改造前一致（定期重载 current.pt）。
+    """
     torch.set_num_threads(2)  # 每进程限制线程数，避免争抢
-    net = XiangqiNet(channels=32, blocks=3)
-    # 等待初始模型
-    for _ in range(600):
-        if os.path.exists(model_path):
-            try:
-                load_model(net, model_path)
-                break
-            except Exception:
+    if use_server:
+        evaluator = ServerEvaluator(req_queue, resp_queue, worker_id)
+    else:
+        net = XiangqiNet(channels=32, blocks=3)
+        # 等待初始模型
+        for _ in range(600):
+            if os.path.exists(model_path):
+                try:
+                    load_model(net, model_path)
+                    break
+                except Exception:
+                    time.sleep(1)
+            else:
                 time.sleep(1)
-        else:
-            time.sleep(1)
-    mcts = MCTS(net, num_simulations=num_simulations, dirichlet_eps=0.25)
+        evaluator = DirectEvaluator(net)
+    mcts = BatchMCTS(evaluator, num_simulations=num_simulations, dirichlet_eps=0.25)
     games = 0
     while not stop_event.is_set():
         try:
-            samples = self_play_game(net, mcts, max_moves=max_moves)
+            samples = self_play_game(None, mcts, max_moves=max_moves)
             sample_queue.put(samples)
             games += 1
-            # 定期重载最新模型
-            if games % games_before_reload == 0:
+            # 定期重载最新模型（仅 CPU 本地推理路径；服务端路径由 server 同步）
+            if not use_server and games % games_before_reload == 0:
                 try:
                     load_model(net, model_path)
                 except Exception:
@@ -85,7 +101,8 @@ class Trainer:
                  eval_every: int = 50, eval_games: int = 4,
                  progress_every: int = 100,
                  channels: int = 32, blocks: int = 3,
-                 resume: bool = True):
+                 resume: bool = True,
+                 eval_batch: int = 128, batch_wait: float = 0.02):
         self.model_dir = model_dir
         self.log_dir = log_dir
         self.num_workers = num_workers
@@ -119,6 +136,22 @@ class Trainer:
         self.buffer = ReplayBuffer(buffer_capacity)
         self.sample_queue = mp.Queue(maxsize=200)
         self.stop_event = mp.Event()
+        # GPU 批量推理池：有 GPU 时启动 InferenceServer（worker 不再持有模型，
+        # 攒批统一推理提升 GPU 利用率）；纯 CPU 时 worker 本地 DirectEvaluator
+        self.eval_batch = eval_batch
+        self.batch_wait = batch_wait
+        self.use_server = torch.cuda.is_available()
+        self.req_queue = mp.Queue(maxsize=1024)
+        self.resp_queues = {i: mp.Queue() for i in range(num_workers)}
+        self.inference_server = None
+        if self.use_server:
+            self.inference_server = InferenceServer(
+                self.model_path, self.req_queue, self.resp_queues,
+                channels=channels, blocks=blocks,
+                max_batch=eval_batch, batch_wait=batch_wait,
+                stop_event=self.stop_event)
+            self.inference_server.start()
+            self._log(f'已启动 GPU 批量推理服务 (max_batch={eval_batch}, wait={batch_wait}s)')
         self.workers = []
         self.total_games = 0
         self.total_samples = 0

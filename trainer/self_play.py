@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
-"""自我对弈：生成训练样本"""
+"""自我对弈：生成训练样本
+
+mcts 由外部传入（支持原 MCTS 或 BatchMCTS + 任意 Evaluator），
+net 参数仅为兼容旧调用保留，推理完全走 mcts 内部的 evaluator。
+"""
 import random
 from core.board import XiangqiBoard, RED, BLACK
 from ai.mcts import MCTS
 from ai.model import XiangqiNet, board_to_tensor
 
 
-def self_play_game(net: XiangqiNet, mcts: MCTS, max_moves: int = 200,
+def self_play_game(net: XiangqiNet, mcts, max_moves: int = 200,
                    temperature_schedule=None) -> list:
     """单局自我对弈，返回样本列表 [(board_tensor, policy, z)]"""
     if temperature_schedule is None:
         temperature_schedule = lambda ply: 1.0 if ply < 30 else (0.5 if ply < 60 else 0.1)
+    _ = net  # 兼容参数：推理走 mcts 的 evaluator，net 不再使用
     board = XiangqiBoard()
     samples = []  # (tensor, policy_dict, current_player)
     ply = 0
