@@ -387,4 +387,8 @@ def main():
 
 
 if __name__ == '__main__':
+    # 关键：GPU 环境下必须用 spawn 创建子进程（fork 会继承 CUDA 上下文导致
+    # RuntimeError: Cannot re-initialize CUDA in forked subprocess）。
+    # Windows 默认 spawn；Linux 默认 fork，必须显式切换。
+    mp.set_start_method('spawn', force=True)
     main()
