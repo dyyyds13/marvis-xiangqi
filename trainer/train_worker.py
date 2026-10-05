@@ -73,6 +73,9 @@ def self_play_worker(worker_id: int, sample_queue, model_path: str, stop_event,
                 except Exception:
                     pass
         except Exception as e:
+            # 记录异常避免静默空转（对云端训练同样重要）
+            print(f'[worker {worker_id}] 对弈异常 {type(e).__name__}: {e}',
+                  file=sys.stderr, flush=True)
             time.sleep(2)
 
 
@@ -238,16 +241,22 @@ class Trainer:
         for i in range(self.num_workers):
             p = mp.Process(target=self_play_worker, args=(
                 i, self.sample_queue, self.model_path, self.stop_event,
-                self.num_simulations), daemon=True)
+                self.num_simulations, 5, 200,
+                self.use_server, self.req_queue, self.resp_queues[i]), daemon=True)
             p.start()
             self.workers.append(p)
-        self._log(f'启动 {self.num_workers} 个自我对弈进程')
+        self._log(f'启动 {self.num_workers} 个自我对弈进程'
+                  f'（推理模式: {"GPU 批量推理服务" if self.use_server else "CPU 本地 DirectEvaluator"}）')
 
     def stop(self):
         self.stop_event.set()
         for p in self.workers:
             p.terminate()
         self.workers = []
+        if self.inference_server is not None:
+            # stop_event 会让 server 主循环自然退出；再显式 terminate 兜底
+            self.inference_server.terminate()
+            self.inference_server = None
         if self.eval_proc is not None:
             self.eval_proc.terminate()
             self.eval_proc = None
@@ -358,6 +367,8 @@ def main():
     parser.add_argument('--eval-interval', type=int, default=300, help='评估间隔(秒)')
     parser.add_argument('--eval-games', type=int, default=4, help='每次评估对局数')
     parser.add_argument('--progress-every', type=int, default=100, help='每 N 训练步刷新一次进度页')
+    parser.add_argument('--eval-batch', type=int, default=128, help='推理服务攒批上限（GPU 批量推理池）')
+    parser.add_argument('--batch-wait', type=float, default=0.02, help='推理服务攒批超时窗口（秒）')
     parser.add_argument('--model-dir', type=str, default='models', help='模型目录')
     parser.add_argument('--log-dir', type=str, default='logs', help='日志目录')
     args = parser.parse_args()
@@ -370,6 +381,7 @@ def main():
         num_workers=args.workers, num_simulations=args.sims,
         batch_size=args.batch, lr=args.lr, eval_games=args.eval_games,
         progress_every=args.progress_every,
+        eval_batch=args.eval_batch, batch_wait=args.batch_wait,
     )
     trainer.run(max_steps=args.steps, eval_interval_sec=args.eval_interval)
 

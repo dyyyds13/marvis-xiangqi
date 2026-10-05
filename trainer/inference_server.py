@@ -13,8 +13,15 @@
 安全约束：
 - CUDA 张量绝不进 mp.Queue：跨进程只传 XiangqiBoard 对象与 Python 数值
 - 推理在 server 进程内完成，结果 .cpu() 转 Python list 后分发
+
+实现说明：
+- 服务以普通 mp.Process(target=...) 方式启动（模块级函数 _server_run），
+  不用 mp.Process 子类：Windows spawn 下子类实例 pickle 会因 _authkey
+  （AuthenticationString 禁止 pickle）崩溃。InferenceServer 类只是薄封装，
+  对外提供 start()/join()/terminate()/is_alive/exitcode 接口。
 """
 import os
+import sys
 import time
 import queue
 import multiprocessing as mp
@@ -25,14 +32,115 @@ from ai.model import XiangqiNet, board_to_tensor
 from trainer.train import load_model
 
 
-class InferenceServer(mp.Process):
-    """批量推理服务进程"""
+def _server_run(model_path, req_queue, resp_queues,
+                channels, blocks, max_batch, batch_wait,
+                stop_event, stats_queue):
+    """推理服务进程主体（模块级函数，Windows spawn 可安全 pickle 参数）"""
+    torch.set_num_threads(4)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    def _model_mtime():
+        try:
+            return os.path.getmtime(model_path)
+        except OSError:
+            return None
+
+    try:
+        net = XiangqiNet(channels=channels, blocks=blocks).to(device)
+        # 等待初始模型文件出现（训练主进程 start_workers 会先保存初始权重）
+        while not stop_event.is_set():
+            if os.path.exists(model_path):
+                try:
+                    load_model(net, model_path, device=device)
+                    break
+                except Exception:
+                    time.sleep(0.2)
+            else:
+                time.sleep(0.2)
+        net.eval()
+        last_mtime = _model_mtime()
+        pending = []  # [{"worker_id": int, "req_id": int, "boards": [XiangqiBoard,...]}, ...]
+        while not stop_event.is_set():
+            # ---- 攒批收集：直到 max_batch 或 batch_wait 超时 ----
+            deadline = time.monotonic() + batch_wait
+            while len(pending) < max_batch:
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    break
+                try:
+                    item = req_queue.get(timeout=remain)
+                except queue.Empty:
+                    break
+                pending.append(item)
+                if len(pending) >= max_batch:
+                    break
+            # ---- 模型热更新：mtime 变化则重新加载（失败保留旧权重，下轮重试）----
+            mt = _model_mtime()
+            if mt is not None and mt != last_mtime:
+                try:
+                    load_model(net, model_path, device=device)
+                    net.eval()
+                    last_mtime = mt
+                except Exception:
+                    pass  # 训练进程可能正在写文件，保留旧权重下轮再试
+            # ---- 统一推理并分发 ----
+            if pending:
+                _process_batch(net, pending, resp_queues, stats_queue, device)
+                pending = []
+        # 退出前清空已收集的剩余请求（stop 场景下 worker 即将被终止）
+        if pending:
+            try:
+                _process_batch(net, pending, resp_queues, stats_queue, device)
+            except Exception:
+                pass
+    except BaseException:
+        # 服务进程异常崩溃必须可见：stderr + 崩溃日志文件
+        import traceback
+        tb = traceback.format_exc()
+        sys.stderr.write(f'[InferenceServer] 崩溃:\n{tb}\n')
+        sys.stderr.flush()
+        crash_log = os.path.join(
+            os.path.dirname(model_path) or '.', 'inference_server_crash.log')
+        try:
+            with open(crash_log, 'a', encoding='utf-8') as f:
+                f.write(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] 崩溃:\n{tb}\n')
+        except Exception:
+            pass
+        raise
+
+
+def _process_batch(net, pending, resp_queues, stats_queue, device):
+    """合并本批所有请求的棋盘，一次推理后按 worker 分发"""
+    total_boards = sum(len(item['boards']) for item in pending)
+    tensors = torch.stack(
+        [board_to_tensor(b) for item in pending for b in item['boards']]
+    ).to(device)
+    with torch.no_grad():
+        p, v = net(tensors)
+        p = torch.softmax(p, dim=1).cpu()  # CUDA 张量禁止进 mp.Queue，转 CPU
+        v = v.squeeze(1).cpu()
+    idx = 0
+    for item in pending:
+        worker_id, req_id = item['worker_id'], item['req_id']
+        n = len(item['boards'])
+        resp = {
+            'req_id': req_id,
+            'ps': p[idx:idx + n].tolist(),   # Python 数值（float list）
+            'vs': v[idx:idx + n].tolist(),
+        }
+        resp_queues[worker_id].put(resp)
+        idx += n
+    if stats_queue is not None:
+        stats_queue.put({'batch_boards': total_boards, 'batch_requests': len(pending)})
+
+
+class InferenceServer:
+    """GPU 批量推理服务进程（薄封装：内部为标准 mp.Process(target=_server_run)）"""
 
     def __init__(self, model_path: str, req_queue, resp_queues,
                  channels: int = 32, blocks: int = 3,
                  max_batch: int = 128, batch_wait: float = 0.02,
                  stop_event=None, stats_queue=None):
-        super().__init__(daemon=True)
         self.model_path = model_path
         self.req_queue = req_queue
         # resp_queues: dict {worker_id: mp.Queue}，每个 worker 独立响应队列，
@@ -45,83 +153,31 @@ class InferenceServer(mp.Process):
         self.stop_event = stop_event if stop_event is not None else mp.Event()
         # 可选：测试用，每批处理后回传批统计（生产不传）
         self.stats_queue = stats_queue
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self._proc = None
 
-    def _model_mtime(self):
-        try:
-            return os.path.getmtime(self.model_path)
-        except OSError:
-            return None
+    def start(self):
+        if self._proc is not None and self._proc.is_alive():
+            return
+        self._proc = mp.Process(
+            target=_server_run,
+            args=(self.model_path, self.req_queue, self.resp_queues,
+                  self.channels, self.blocks, self.max_batch, self.batch_wait,
+                  self.stop_event, self.stats_queue),
+            daemon=True)
+        self._proc.start()
 
-    def run(self):
-        torch.set_num_threads(4)
-        net = XiangqiNet(channels=self.channels, blocks=self.blocks).to(self.device)
-        # 等待初始模型文件出现（训练主进程 start_workers 会先保存初始权重）
-        while not self.stop_event.is_set():
-            if os.path.exists(self.model_path):
-                try:
-                    load_model(net, self.model_path, device=self.device)
-                    break
-                except Exception:
-                    time.sleep(0.2)
-            else:
-                time.sleep(0.2)
-        net.eval()
-        last_mtime = self._model_mtime()
-        pending = []  # [(worker_id, req_id, boards), ...]
-        while not self.stop_event.is_set():
-            # ---- 攒批收集：直到 max_batch 或 batch_wait 超时 ----
-            deadline = time.monotonic() + self.batch_wait
-            while len(pending) < self.max_batch:
-                remain = deadline - time.monotonic()
-                if remain <= 0:
-                    break
-                try:
-                    item = self.req_queue.get(timeout=remain)
-                except queue.Empty:
-                    break
-                pending.append(item)
-                if len(pending) >= self.max_batch:
-                    break
-            # ---- 模型热更新：mtime 变化则重新加载（失败保留旧权重，下轮重试）----
-            mt = self._model_mtime()
-            if mt is not None and mt != last_mtime:
-                try:
-                    load_model(net, self.model_path, device=self.device)
-                    net.eval()
-                    last_mtime = mt
-                except Exception:
-                    pass  # 训练进程可能正在写文件，保留旧权重下轮再试
-            # ---- 统一推理并分发 ----
-            if pending:
-                self._process_batch(net, pending)
-                pending = []
-        # 退出前清空已收集的剩余请求（stop 场景下 worker 即将被终止）
-        if pending:
-            try:
-                self._process_batch(net, pending)
-            except Exception:
-                pass
+    def join(self, timeout=None):
+        if self._proc is not None:
+            self._proc.join(timeout)
 
-    def _process_batch(self, net, pending):
-        """合并本批所有请求的棋盘，一次推理后按 worker 分发"""
-        total_boards = sum(len(item[2]) for item in pending)
-        tensors = torch.stack(
-            [board_to_tensor(b) for item in pending for b in item[2]]
-        ).to(self.device)
-        with torch.no_grad():
-            p, v = net(tensors)
-            p = torch.softmax(p, dim=1).cpu()  # CUDA 张量禁止进 mp.Queue，转 CPU
-            v = v.squeeze(1).cpu()
-        idx = 0
-        for worker_id, req_id, boards in pending:
-            n = len(boards)
-            resp = {
-                'req_id': req_id,
-                'ps': p[idx:idx + n].tolist(),   # Python 数值（float list）
-                'vs': v[idx:idx + n].tolist(),
-            }
-            self.resp_queues[worker_id].put(resp)
-            idx += n
-        if self.stats_queue is not None:
-            self.stats_queue.put({'batch_boards': total_boards, 'batch_requests': len(pending)})
+    def terminate(self):
+        if self._proc is not None:
+            self._proc.terminate()
+
+    @property
+    def is_alive(self):
+        return self._proc is not None and self._proc.is_alive()
+
+    @property
+    def exitcode(self):
+        return None if self._proc is None else self._proc.exitcode

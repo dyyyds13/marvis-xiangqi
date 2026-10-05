@@ -252,13 +252,18 @@ class BatchMCTS:
 
     def __init__(self, evaluator: Evaluator, c_puct: float = 1.5,
                  num_simulations: int = 200, virtual_loss: int = 1,
-                 dirichlet_alpha: float = 0.3, dirichlet_eps: float = 0.25):
+                 dirichlet_alpha: float = 0.3, dirichlet_eps: float = 0.25,
+                 batch_size: int = 64):
         self.evaluator = evaluator
         self.c_puct = c_puct
         self.num_simulations = num_simulations
         self.virtual_loss = virtual_loss
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_eps = dirichlet_eps
+        # 每轮批量收集的模拟条数：收集 batch_size 条路径 -> 批量评估唯一叶 ->
+        # 统一扩展 + backup，再进入下一轮，使 UCB 统计随轮次更新。
+        # batch_size=1 时与逐模拟扩展的 MCTS 完全等价（语义一致性基准）。
+        self.batch_size = max(1, int(batch_size))
 
     # ---- 与 MCTS 相同的树操作 ----
     def _uct(self, node: MCTSNode, child: MCTSNode) -> float:
@@ -313,48 +318,53 @@ class BatchMCTS:
                 torch.full((len(root.children),), self.dirichlet_alpha)).sample()
             for i, (mv, child) in enumerate(root.children.items()):
                 child.prior = (1 - self.dirichlet_eps) * child.prior + self.dirichlet_eps * float(noise[i])
-        # (b) 收集 num_simulations 条模拟路径与叶局面（fen 去重）
-        sims = []  # (path, leaf_node, leaf_board_snapshot)
-        leaf_boards = {}  # fen -> board snapshot（可哈希局面标识去重）
-        for _ in range(self.num_simulations):
-            node = root
-            path = []
-            b = board.copy()  # 从根快照独立推进，不改动调用方棋盘
-            while node.is_expanded() and node.children:
-                best_move = max(node.children, key=lambda m: self._uct(node, node.children[m]))
-                child = node.children[best_move]
-                path.append(child)
-                node = child
-                b.make_move(child.move)
-            # 到达未扩展叶（含游戏结束局面）
-            sims.append((path, node, b))
-            leaf_boards[b.fen()] = b
-        # (c) 唯一叶局面批量评估
-        unique_boards = list(leaf_boards.values())
-        if unique_boards:
-            ps, vs = self.evaluator.evaluate(unique_boards)
-            eval_by_fen = {b.fen(): (ps[i], vs[i]) for i, b in enumerate(unique_boards)}
-        else:
-            eval_by_fen = {}
-        # (d) 批量扩展 + 按路径 backup
-        for path, node, b in sims:
-            result = b.result()
-            if result is not None:
-                # 游戏结束：用真实结果，不扩展不推理
-                value = self._terminal_value(b)
+        # (b) 分轮批量收集：每轮收集 batch_size 条模拟路径（不足则到
+        # num_simulations 为止），收集完统一评估扩展后再进下一轮，
+        # 保证后续 select 能看到已更新的 visit/prior 统计（UCB 正常工作）
+        sims_done = 0
+        while sims_done < self.num_simulations:
+            batch = []  # (path, leaf_node, leaf_board_snapshot)
+            leaf_boards = {}  # fen -> board snapshot（可哈希局面标识去重）
+            while len(batch) < self.batch_size and sims_done < self.num_simulations:
+                node = root
+                path = []
+                b = board.copy()  # 从根快照独立推进，不改动调用方棋盘
+                while node.is_expanded() and node.children:
+                    best_move = max(node.children, key=lambda m: self._uct(node, node.children[m]))
+                    child = node.children[best_move]
+                    path.append(child)
+                    node = child
+                    b.make_move(child.move)
+                # 到达未扩展叶（含游戏结束局面）
+                sims_done += 1
+                batch.append((path, node, b))
+                leaf_boards[b.fen()] = b
+            # (c) 本轮唯一叶局面批量评估
+            unique_boards = list(leaf_boards.values())
+            if unique_boards:
+                ps, vs = self.evaluator.evaluate(unique_boards)
+                eval_by_fen = {b.fen(): (ps[i], vs[i]) for i, b in enumerate(unique_boards)}
             else:
-                p_leaf, v_leaf = eval_by_fen[b.fen()]
-                value = v_leaf
-                if not node.is_expanded():
-                    self._expand_node(node, b, p_leaf)
-            # 反向传播（value 是当前节点视角）
-            node.visit_count += 1
-            node.total_value += value
-            value = -value
-            for n in reversed(path):
-                n.visit_count += 1
-                n.total_value += value
+                eval_by_fen = {}
+            # (d) 批量扩展 + 按路径 backup
+            for path, node, b in batch:
+                result = b.result()
+                if result is not None:
+                    # 游戏结束：用真实结果，不扩展不推理
+                    value = self._terminal_value(b)
+                else:
+                    p_leaf, v_leaf = eval_by_fen[b.fen()]
+                    value = v_leaf
+                    if not node.is_expanded():
+                        self._expand_node(node, b, p_leaf)
+                # 反向传播（value 是当前节点视角）
+                node.visit_count += 1
+                node.total_value += value
                 value = -value
+                for n in reversed(path):
+                    n.visit_count += 1
+                    n.total_value += value
+                    value = -value
         # 根节点概率分布（与原 MCTS 相同：温度调度）
         if temperature == 0:
             best_mv = max(root.children, key=lambda m: root.children[m].visit_count)
