@@ -314,6 +314,30 @@ class Trainer:
             self._log('胜率达标，已保存为 best.pt')
             self._notify_baseline_win(stats)
 
+    def _ensure_server(self):
+        """监控推理服务进程：崩溃后自动用同一队列重启，避免 worker 永久卡死"""
+        if not self.use_server:
+            return
+        if self.inference_server is not None and self.inference_server.is_alive:
+            return
+        old = self.inference_server
+        code = None if old is None else old.exitcode
+        # 先确保旧进程完全退出（句柄清理），再重启；立即 spawn 在 Windows
+        # 上可能与旧进程残留句柄竞争，导致新进程读不到请求（见 expC4/expC5）
+        if old is not None:
+            old.join(timeout=5)
+        time.sleep(0.5)
+        self._log(f'推理服务进程已退出（exitcode={code}），'
+                  f'请查看 {os.path.join(self.model_dir, "inference_server_crash.log")}；'
+                  f'正在自动重启…')
+        self.inference_server = InferenceServer(
+            self.model_path, self.req_queue, self.resp_queues,
+            channels=self.channels, blocks=self.blocks,
+            max_batch=self.eval_batch, batch_wait=self.batch_wait,
+            stop_event=self.stop_event)
+        self.inference_server.start()
+        self._log(f'推理服务已自动重启 (alive={self.inference_server.is_alive})')
+
     def run(self, max_steps: int = 100000, eval_interval_sec: int = 300):
         """主训练循环（评估异步进行，不阻塞训练）"""
         self.start_workers()
@@ -346,6 +370,8 @@ class Trainer:
                     last_eval = time.time()
                     self._start_evaluate()
                 self._poll_evaluate()
+                # 推理服务崩溃检测与自动重启（含崩溃日志指引）
+                self._ensure_server()
                 time.sleep(0.05)
         except KeyboardInterrupt:
             self._log('训练中断')

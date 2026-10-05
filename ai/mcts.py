@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """AlphaZero 式 MCTS：UBC 公式 + 虚拟损失 + 转置表"""
 import math
+import queue
 import random
+import time
 import torch
 import torch.nn.functional as F
 from core.board import XiangqiBoard, RED, BLACK
@@ -218,10 +220,11 @@ class ServerEvaluator(Evaluator):
     返回（FIFO），因此 req_id 自增配对天然成立，多 worker 无交叉消费。
     """
 
-    def __init__(self, req_queue, resp_queue, worker_id: int):
+    def __init__(self, req_queue, resp_queue, worker_id: int, timeout: float = 15.0):
         self.req_queue = req_queue
         self.resp_queue = resp_queue
         self.worker_id = worker_id
+        self.timeout = timeout
         self._next_req_id = 0
 
     def evaluate(self, boards):
@@ -234,8 +237,21 @@ class ServerEvaluator(Evaluator):
             'req_id': req_id,
             'boards': boards,
         })
-        resp = self.resp_queue.get()  # 阻塞等待本 worker 队列的响应
-        return resp['ps'], resp['vs']
+        # 超时保护：推理服务崩溃后不永久阻塞（上层捕获后重试，
+        # 避免 worker 全部卡死、回放池枯竭、loss 过拟合到 0）
+        # 响应带 req_id 校验：超时重试后队列里可能残留旧响应，必须丢弃
+        # 不匹配的旧响应，避免新旧请求错配污染搜索结果
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                resp = self.resp_queue.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                raise TimeoutError(
+                    f'[worker {self.worker_id}] 推理服务响应超时 ({self.timeout}s)'
+                    f' req_id={req_id}，服务可能已崩溃')
+            if resp.get('req_id') == req_id:
+                return resp['ps'], resp['vs']
+            # 旧请求残留响应（超时重试场景），丢弃继续等
 
 
 class BatchMCTS:

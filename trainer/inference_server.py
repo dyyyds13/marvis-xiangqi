@@ -38,6 +38,11 @@ def _server_run(model_path, req_queue, resp_queues,
     """推理服务进程主体（模块级函数，Windows spawn 可安全 pickle 参数）"""
     torch.set_num_threads(4)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    debug = os.environ.get('MARVIS_SERVER_DEBUG', '') == '1'
+
+    def _dbg(msg):
+        if debug:
+            print(f'[server-debug] {msg}', file=sys.stderr, flush=True)
 
     def _model_mtime():
         try:
@@ -54,10 +59,16 @@ def _server_run(model_path, req_queue, resp_queues,
                     load_model(net, model_path, device=device)
                     break
                 except Exception:
+                    _dbg('init load fail, retry')
                     time.sleep(0.2)
             else:
                 time.sleep(0.2)
         net.eval()
+        _dbg(f'[pid={os.getpid()}] entered main loop')
+        # 启动延迟：terminate 旧进程后立即重启的新进程若过早读共享 mp.Queue，
+        # Windows spawn 下可能读不到数据（句柄清理竞态，见 expCq）。进入主
+        # 循环前先让出 1s，等待旧进程句柄完全释放（本地 expCq 系列验证有效）。
+        time.sleep(1.0)
         last_mtime = _model_mtime()
         pending = []  # [{"worker_id": int, "req_id": int, "boards": [XiangqiBoard,...]}, ...]
         while not stop_event.is_set():
@@ -72,6 +83,7 @@ def _server_run(model_path, req_queue, resp_queues,
                 except queue.Empty:
                     break
                 pending.append(item)
+                _dbg(f'got req worker={item["worker_id"]} pending={len(pending)}')
                 if len(pending) >= max_batch:
                     break
             # ---- 模型热更新：mtime 变化则重新加载（失败保留旧权重，下轮重试）----
@@ -81,12 +93,21 @@ def _server_run(model_path, req_queue, resp_queues,
                     load_model(net, model_path, device=device)
                     net.eval()
                     last_mtime = mt
+                    _dbg('hot reload done')
                 except Exception:
                     pass  # 训练进程可能正在写文件，保留旧权重下轮再试
             # ---- 统一推理并分发 ----
             if pending:
+                _dbg(f'process batch {len(pending)}')
                 _process_batch(net, pending, resp_queues, stats_queue, device)
                 pending = []
+                _dbg('batch responded')
+            # 让步：避免忙循环空转烧 CPU；同时规避 Windows spawn 下同一
+            # mp.Queue 被 terminate 后重启进程时读端句柄竞争的竞态（见
+            # expD/expF/expCq：让步不足时重启的 server 持续 get 不到请求，
+            # 有 stderr 打印/更大 sleep 时恢复正常）。数值经 expC_quick
+            # 验证：0.05 在 8 worker 崩溃恢复场景稳定通过。
+            time.sleep(0.05)
         # 退出前清空已收集的剩余请求（stop 场景下 worker 即将被终止）
         if pending:
             try:

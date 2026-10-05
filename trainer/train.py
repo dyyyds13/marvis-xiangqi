@@ -78,7 +78,10 @@ def train_loop(net: XiangqiNet, buffer: ReplayBuffer, optimizer, num_steps: int,
 
 def save_model(net: XiangqiNet, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save(net.state_dict(), path)
+    # 原子写入：先写临时文件再 rename，避免推理服务进程读到半写文件
+    tmp = path + '.tmp'
+    torch.save(net.state_dict(), tmp)
+    os.replace(tmp, path)
 
 
 def load_model(net: XiangqiNet, path: str, device='cpu'):
