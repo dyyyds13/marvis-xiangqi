@@ -159,6 +159,7 @@ class Trainer:
         self.total_games = 0
         self.total_samples = 0
         self.train_steps = 0
+        self.pending_samples = 0  # 跨轮累积未训练样本（与新增样本挂钩）
         # 异步评估
         self.eval_probe_path = os.path.join(model_dir, 'eval_probe.pt')
         self.eval_queue = mp.Queue()
@@ -349,12 +350,13 @@ class Trainer:
             while self.train_steps < max_steps and not self.stop_event.is_set():
                 # 收样本
                 added = self._drain_queue()
-                # 样本足够则训练（每步保存/打日志，避免跳号）
-                if len(self.buffer) >= self.batch_size and added > 0:
-                    # 训练步数与新增样本挂钩：新增样本少时少训，避免抽干
-                    # buffer 导致 loss 过拟合到 0（云端样本供给跟不上时，
-                    # 固定 train_every=64 会把 buffer 反复抽空）
-                    steps = min(self.train_every, max(1, added // self.batch_size))
+                # 训练步数与新增样本挂钩：跨轮累积，攒满一个 batch 才训练，
+                # 避免样本供给不足时每轮强制重采样旧样本导致 loss 过拟合到 0
+                # （原 max(1, added//batch) 兜底在 added<batch 时仍强训 1 步）
+                self.pending_samples += added
+                steps = min(self.train_every, self.pending_samples // self.batch_size)
+                self.pending_samples -= steps * self.batch_size
+                if steps > 0:
                     for _ in range(steps):
                         if len(self.buffer) < self.batch_size:
                             break
