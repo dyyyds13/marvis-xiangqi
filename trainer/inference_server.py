@@ -104,10 +104,12 @@ def _server_run(model_path, req_queue, resp_queues,
                 _dbg('batch responded')
             # 让步：避免忙循环空转烧 CPU；同时规避 Windows spawn 下同一
             # mp.Queue 被 terminate 后重启进程时读端句柄竞争的竞态（见
-            # expD/expF/expCq：让步不足时重启的 server 持续 get 不到请求，
-            # 有 stderr 打印/更大 sleep 时恢复正常）。数值经 expC_quick
-            # 验证：0.05 在 8 worker 崩溃恢复场景稳定通过。
-            time.sleep(0.05)
+            # expD/expF/expCq）。本地 Windows CPU 场景用 0.05 验证稳定；
+            # 云端 GPU 推理仅数毫秒，0.05 的固定 sleep 会把单请求延迟拉高
+            # 到 70ms+，8 worker 串行请求下吞吐骤降、样本枯竭、loss 过拟合
+            # 到 0。云端 Linux 无 Windows 句柄竞态，0.002 足够让步且不拖
+            # 吞吐；Windows 场景可经环境变量调回（见下）。
+            time.sleep(float(os.environ.get('MARVIS_SERVER_SLEEP', '0.002')))
         # 退出前清空已收集的剩余请求（stop 场景下 worker 即将被终止）
         if pending:
             try:

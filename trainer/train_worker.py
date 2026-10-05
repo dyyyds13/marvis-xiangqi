@@ -351,7 +351,11 @@ class Trainer:
                 added = self._drain_queue()
                 # 样本足够则训练（每步保存/打日志，避免跳号）
                 if len(self.buffer) >= self.batch_size and added > 0:
-                    for _ in range(self.train_every):
+                    # 训练步数与新增样本挂钩：新增样本少时少训，避免抽干
+                    # buffer 导致 loss 过拟合到 0（云端样本供给跟不上时，
+                    # 固定 train_every=64 会把 buffer 反复抽空）
+                    steps = min(self.train_every, max(1, added // self.batch_size))
+                    for _ in range(steps):
                         if len(self.buffer) < self.batch_size:
                             break
                         batch = self.buffer.sample(self.batch_size)

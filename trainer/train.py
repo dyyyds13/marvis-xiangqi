@@ -80,8 +80,15 @@ def save_model(net: XiangqiNet, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # 原子写入：先写临时文件再 rename，避免推理服务进程读到半写文件
     tmp = path + '.tmp'
-    torch.save(net.state_dict(), tmp)
-    os.replace(tmp, path)
+    try:
+        torch.save(net.state_dict(), tmp)
+        os.replace(tmp, path)
+    except Exception as e:
+        # 中断/并发场景下 tmp 可能不完整或已被消费（如 Ctrl+C 打断保存，
+        # finally 再存时 tmp 已被 rename），保存失败不应让训练崩溃，
+        # 打印警告继续（下次保存会重写）。
+        print(f'[save_model] 保存 {path} 失败（跳过，训练继续）: '
+              f'{type(e).__name__}: {e}', flush=True)
 
 
 def load_model(net: XiangqiNet, path: str, device='cpu'):
